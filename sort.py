@@ -1,26 +1,7 @@
-"""
-    SORT: A Simple, Online and Realtime Tracker
-    Copyright (C) 2016-2020 Alex Bewley alex@bewley.ai
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-"""
-from __future__ import print_function
-
 import os
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
+# matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from skimage import io
@@ -29,6 +10,9 @@ import glob
 import time
 import argparse
 from filterpy.kalman import KalmanFilter
+
+import posixpath
+from pathlib import Path
 
 try:
   from numba import jit
@@ -116,12 +100,20 @@ class KalmanBoxTracker(object):
     self.kf.Q[4:,4:] *= 0.01
 
     self.kf.x[:4] = convert_bbox_to_z(bbox)
+    #某条track离上次更新过了多久
     self.time_since_update = 0
+    #是创建的第几个track
     self.id = KalmanBoxTracker.count
     KalmanBoxTracker.count += 1
+    #用来存预测的bbox的历史值，有一堆
+    #预测的时候取[-1]那个
     self.history = []
+    #某个track总的更新次数
     self.hits = 0
+    #某个track连续更新的次数，丢掉一次就置0
     self.hit_streak = 0
+    #某个track从初始化到当前frame经历了多少frame
+    #就是这个track的年纪
     self.age = 0
 
   def update(self,bbox):
@@ -133,14 +125,20 @@ class KalmanBoxTracker(object):
     self.hits += 1
     self.hit_streak += 1
     self.kf.update(convert_bbox_to_z(bbox))
+    # print("kkk")
+    # print(self.kf.P)
 
   def predict(self):
     """
     Advances the state vector and returns the predicted bounding box estimate.
     """
     if((self.kf.x[6]+self.kf.x[2])<=0):
+    #kf.x[6]是面积必须>0，kf.x[2]是面积的变化率,有负值
+    #kf.x[6]+kf.x[2]预测出来的下一刻的面积
+    #所以必须是正值
       self.kf.x[6] *= 0.0
     self.kf.predict()
+    #age与是否有观测无关
     self.age += 1
     if(self.time_since_update>0):
       self.hit_streak = 0
@@ -172,6 +170,8 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
   if min(iou_matrix.shape) > 0:
     a = (iou_matrix > iou_threshold).astype(np.int32)
     if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+    #意思是每行每列有且只有一个1
+    #就是最好的匹配了，不用再跑linear-assignment
         matched_indices = np.stack(np.where(a), axis=1)
     else:
       matched_indices = linear_assignment(-iou_matrix)
@@ -188,6 +188,10 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
       unmatched_trackers.append(t)
 
   #filter out matched with low IOU
+  #前面有a = (iou_matrix > iou_threshold).astype(np.int32)
+  #但是跑matched_indices = linear_assignment(-iou_matrix)这个的时候是没有去低iou的
+  #所以这里要专门去低iou
+
   matches = []
   for m in matched_indices:
     if(iou_matrix[m[0], m[1]]<iou_threshold):
@@ -212,7 +216,7 @@ class Sort(object):
     self.min_hits = min_hits
     self.trackers = []
     self.frame_count = 0
-
+  #3步：预测，关联，更新关联上的track
   def update(self, dets=np.empty((0, 5))):
     """
     Params:
@@ -226,12 +230,18 @@ class Sort(object):
     # get predicted locations from existing trackers.
     trks = np.zeros((len(self.trackers), 5))
     to_del = []
+    #ret是输出的跟踪结果
     ret = []
     for t, trk in enumerate(trks):
       pos = self.trackers[t].predict()[0]
+      #trk[:]这样写会改变trks中的值
       trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+      #在配套的mot15数据集上没有出现nan数据
+      #即没用到下面这个if处理
       if np.any(np.isnan(pos)):
         to_del.append(t)
+      #masked_invalid去掉NaN/infs 这种异常值
+      #compress_rows去掉包含掩码值的
     trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
     for t in reversed(to_del):
       self.trackers.pop(t)
@@ -243,11 +253,14 @@ class Sort(object):
 
     # create and initialise new trackers for unmatched detections
     for i in unmatched_dets:
+        #KalmanBoxTracker()传参会调用类的初始化函数init
         trk = KalmanBoxTracker(dets[i,:])
         self.trackers.append(trk)
     i = len(self.trackers)
     for trk in reversed(self.trackers):
         d = trk.get_state()[0]
+        #只返回当前帧更新了的
+        #且连续命中3帧/或未连续命中3帧，但在视频前3帧里的
         if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
           ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
         i -= 1
@@ -285,16 +298,24 @@ if __name__ == '__main__':
 
   if not os.path.exists('output'):
     os.makedirs('output')
-  pattern = os.path.join(args.seq_path, phase, '*', 'det', 'det.txt')
-  for seq_dets_fn in glob.glob(pattern):
+  # pattern = os.path.join(args.seq_path, phase, '*', 'det', 'det.txt')
+  pattern = posixpath.join(args.seq_path, phase, '*', 'det', 'det.txt')
+
+  pattern_root=posixpath.join(args.seq_path, phase)
+  pattern_search=posixpath.join('*', 'det', 'det.txt')
+
+  # edit by cws to run in windows 10.
+  for seq_dets_fn_win_path in Path(pattern_root).glob(pattern_search):
+    seq_dets_fn=seq_dets_fn_win_path.as_posix()
     mot_tracker = Sort() #create instance of the SORT tracker
     seq_dets = np.loadtxt(seq_dets_fn, delimiter=',')
     seq = seq_dets_fn[pattern.find('*'):].split('/')[0]
-    
+
     with open('output/%s.txt'%(seq),'w') as out_file:
       print("Processing %s."%(seq))
       for frame in range(int(seq_dets[:,0].max())):
         frame += 1 #detection and frame numbers begin at 1
+        #seq_dets[:, 0]==frame得到当前帧的true/false掩膜
         dets = seq_dets[seq_dets[:, 0]==frame, 2:7]
         dets[:, 2:4] += dets[:, 0:2] #convert to [x1,y1,w,h] to [x1,y1,x2,y2]
         total_frames += 1
