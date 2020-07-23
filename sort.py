@@ -235,6 +235,9 @@ class Sort(object):
     for t, trk in enumerate(trks):
       pos = self.trackers[t].predict()[0]
       #trk[:]这样写会改变trks中的值!
+      #因trk是trks[t]的浅拷贝，大于1维的维度里存的是地址
+      #对大于1维的维度进行操作，会改变trks[t]和trk的值
+      #for循环的都是浅拷贝
       trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
       #在配套的mot15数据集上没有出现nan数据
       #即没用到下面这个if处理
